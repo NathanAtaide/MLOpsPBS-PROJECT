@@ -54,24 +54,33 @@ def _fingerprint(filename):
     }
 
 
-# Baseline: GradientBoostingClassifier trained on one-hot features (needs model_features.joblib).
-baseline_model = _load(MODEL_FILES["baseline"])
-baseline_features = _load("model_features.joblib") or []
-# Optimized: full sklearn Pipeline that takes the raw inputs directly (created by the notebook).
-optimized_model = _load(MODEL_FILES["optimized"])
+def load_models():
+    """(Re)load every model from MODEL_DIR. Runs at startup and on POST /reload."""
+    global baseline_model, baseline_features, optimized_model, MODELS, MODEL_INFO
 
-MODELS = {
-    name: model
-    for name, model in {"baseline": baseline_model, "optimized": optimized_model}.items()
-    if model is not None
-}
-# Fingerprint + estimator type of every loaded model (computed once at startup)
-MODEL_INFO = {
-    name: {**_fingerprint(MODEL_FILES[name]), "estimator": type(model).__name__}
-    for name, model in MODELS.items()
-}
-for name, info in MODEL_INFO.items():
-    log.info("[fitcheck] loaded %s model: %s", name, info)
+    # Baseline: GradientBoostingClassifier trained on one-hot features (needs model_features.joblib).
+    baseline_model = _load(MODEL_FILES["baseline"])
+    baseline_features = _load("model_features.joblib") or []
+    # Optimized: full sklearn Pipeline that takes the raw inputs directly (notebook or Airflow retrain).
+    optimized_model = _load(MODEL_FILES["optimized"])
+
+    models = {
+        name: model
+        for name, model in {"baseline": baseline_model, "optimized": optimized_model}.items()
+        if model is not None
+    }
+    # Fingerprint + estimator type of every loaded model
+    info = {
+        name: {**_fingerprint(MODEL_FILES[name]), "estimator": type(model).__name__}
+        for name, model in models.items()
+    }
+    # Swap both dicts only after everything loaded, so requests never see a half-reloaded state
+    MODELS, MODEL_INFO = models, info
+    for name, details in MODEL_INFO.items():
+        log.info("[fitcheck] loaded %s model: %s", name, details)
+
+
+load_models()
 
 
 class PredictionInput(BaseModel):
@@ -107,9 +116,18 @@ def list_models():
     return {"available_models": list(MODELS), "models": MODEL_INFO, "bounds": BOUNDS, "classes": CLASS_LABELS}
 
 
+@app.post("/reload")
+def reload_models():
+    """Re-read the model files from Models/ (called by the Airflow retrain DAG after a promotion)."""
+    load_models()
+    return {"available_models": list(MODELS), "models": MODEL_INFO}
+
+
 @app.post("/predict")
 def predict(data: PredictionInput):
-    model = MODELS.get(data.model)
+    # Take one consistent snapshot, in case /reload swaps the models mid-request
+    models, model_info = MODELS, MODEL_INFO
+    model = models.get(data.model)
     if model is None:
         raise HTTPException(status_code=503, detail=f"Model '{data.model}' is not loaded")
 
@@ -131,7 +149,7 @@ def predict(data: PredictionInput):
     # 4. Audit trail: the exact row the model received and which model file answered
     model_input_row = {k: (v.item() if hasattr(v, "item") else v) for k, v in model_input.iloc[0].items()}
     log.info("[fitcheck] predict model=%s sha=%s input=%s -> %s %s (%.1f ms)",
-             data.model, MODEL_INFO[data.model]["sha256"], model_input_row,
+             data.model, model_info[data.model]["sha256"], model_input_row,
              CLASS_LABELS.get(prediction_id), probs, inference_ms)
 
     return {
@@ -142,7 +160,7 @@ def predict(data: PredictionInput):
         "model": data.model,
         "probabilities": probs,
         # Traceability fields (added; the original fields above are unchanged)
-        "model_info": MODEL_INFO[data.model],
+        "model_info": model_info[data.model],
         "model_input": model_input_row,
         "inference_ms": round(inference_ms, 2),
     }
