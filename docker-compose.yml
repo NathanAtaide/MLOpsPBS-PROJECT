@@ -1,7 +1,7 @@
 # FitCheck MLOps stack: one image, four services.
 #   docker compose up -d --build
 #   Jupyter -> http://localhost:8888   MLflow -> http://localhost:5001
-#   API + UI -> http://localhost:3000  Airflow -> http://localhost:8080
+#   API + UI -> http://localhost:3000  Airflow -> http://localhost:8081 (AIRFLOW_HOST_PORT)
 #
 # Ports are bound to 127.0.0.1 only: Jupyter and Airflow run without a login, so they
 # must not be reachable from other machines on your network.
@@ -11,6 +11,9 @@ x-fitcheck-image: &fitcheck-image
     context: .
     dockerfile: docker/Dockerfile
   image: fitcheck-mlops:latest
+  # Always (re)build on `up` instead of reusing an old fitcheck-mlops:latest (e.g. one built
+  # from another branch without Airflow). Unchanged layers come from cache, so it is quick.
+  pull_policy: build
 
 services:
   mlflow:
@@ -92,9 +95,16 @@ services:
     container_name: fitcheck-airflow
     # Standalone = scheduler + DAG processor + triggerer + API server/UI in one container,
     # with a SQLite metadata DB. Fine for local development, not for production.
-    command: /opt/airflow-venv/bin/airflow standalone
+    # Standalone starts each component as `airflow <component>` looked up on PATH, so
+    # Airflow's virtualenv must be on PATH, only for this service: image-wide it would make
+    # `python` point to the venv (no scikit-learn) in the API/Jupyter/MLflow containers.
+    # ($$ = a literal $ for the shell; a single $ would be substituted by docker compose.)
+    command: ["sh", "-c", "export PATH=/opt/airflow-venv/bin:$$PATH && exec airflow standalone"]
     working_dir: /app
     environment:
+      # API server / UI listens on all interfaces inside the container, port 8080
+      AIRFLOW__API__HOST: 0.0.0.0
+      AIRFLOW__API__PORT: "8080"
       AIRFLOW__CORE__DAGS_FOLDER: /app/airflow/dags
       AIRFLOW__CORE__LOAD_EXAMPLES: "False"
       # No login screen: whoever opens the UI is admin (safe only because the port is localhost-only)
@@ -113,7 +123,9 @@ services:
       KAGGLE_USERNAME: ${KAGGLE_USERNAME:-}
       KAGGLE_KEY: ${KAGGLE_KEY:-}
     ports:
-      - "127.0.0.1:8080:8080"
+      # Host port 8081 by default, so it doesn't clash with another Airflow on 8080 (Airflow's
+      # default). Change it with AIRFLOW_HOST_PORT in a .env file; inside the container it stays 8080.
+      - "127.0.0.1:${AIRFLOW_HOST_PORT:-8081}:8080"
     volumes:
       # Project mounted read-write: the pipeline writes data/ (dataset + state) and Models/
       - .:/app
