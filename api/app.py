@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from fitcheck import submissions
 from fitcheck.features import BOUNDS, CLASS_LABELS, RAW_FEATURES, bmi, build_baseline_features
 
 app = FastAPI(title="FitCheck Microservice", version="1.1.0")
@@ -54,35 +55,52 @@ def _fingerprint(filename):
     }
 
 
-# Baseline: GradientBoostingClassifier trained on one-hot features (needs model_features.joblib).
-baseline_model = _load(MODEL_FILES["baseline"])
-baseline_features = _load("model_features.joblib") or []
-# Optimized: full sklearn Pipeline that takes the raw inputs directly (created by the notebook).
-optimized_model = _load(MODEL_FILES["optimized"])
+def load_models():
+    """(Re)load every model from MODEL_DIR. Runs at startup and on POST /reload."""
+    global baseline_model, baseline_features, optimized_model, MODELS, MODEL_INFO
 
-MODELS = {
-    name: model
-    for name, model in {"baseline": baseline_model, "optimized": optimized_model}.items()
-    if model is not None
-}
-# Fingerprint + estimator type of every loaded model (computed once at startup)
-MODEL_INFO = {
-    name: {**_fingerprint(MODEL_FILES[name]), "estimator": type(model).__name__}
-    for name, model in MODELS.items()
-}
-for name, info in MODEL_INFO.items():
-    log.info("[fitcheck] loaded %s model: %s", name, info)
+    # Baseline: GradientBoostingClassifier trained on one-hot features (needs model_features.joblib).
+    baseline_model = _load(MODEL_FILES["baseline"])
+    baseline_features = _load("model_features.joblib") or []
+    # Optimized: full sklearn Pipeline that takes the raw inputs directly (notebook or Airflow retrain).
+    optimized_model = _load(MODEL_FILES["optimized"])
+
+    models = {
+        name: model
+        for name, model in {"baseline": baseline_model, "optimized": optimized_model}.items()
+        if model is not None
+    }
+    # Fingerprint + estimator type of every loaded model
+    info = {
+        name: {**_fingerprint(MODEL_FILES[name]), "estimator": type(model).__name__}
+        for name, model in models.items()
+    }
+    # Swap both dicts only after everything loaded, so requests never see a half-reloaded state
+    MODELS, MODEL_INFO = models, info
+    for name, details in MODEL_INFO.items():
+        log.info("[fitcheck] loaded %s model: %s", name, details)
 
 
-class PredictionInput(BaseModel):
+load_models()
+
+
+class FitMeasurements(BaseModel):
     # Bounds match the ranges the training data was clipped to.
     height_cm: float = Field(ge=BOUNDS["height_cm"][0], le=BOUNDS["height_cm"][1])
     weight_kg: float = Field(ge=BOUNDS["weight_kg"][0], le=BOUNDS["weight_kg"][1])
     garment_chest_cm: float = Field(ge=BOUNDS["garment_chest_cm"][0], le=BOUNDS["garment_chest_cm"][1])
     fabric_stretch_pct: float = Field(ge=BOUNDS["fabric_stretch_pct"][0], le=BOUNDS["fabric_stretch_pct"][1])
     product_type_id: Literal[0, 1, 2]  # 0: Tops, 1: Bottoms, 2: Jackets
+
+
+class PredictionInput(FitMeasurements):
     # Which model to use; defaults to the baseline to keep the original API behaviour.
     model: Optional[Literal["baseline", "optimized"]] = "baseline"
+
+
+class SubmissionInput(FitMeasurements):
+    # What the user really experienced when trying the garment on (the training label).
+    actual_fit: Literal[0, 1, 2]  # 0: Too Small, 1: Good Fit, 2: Too Large
 
 
 @app.get("/", include_in_schema=False)
@@ -107,9 +125,41 @@ def list_models():
     return {"available_models": list(MODELS), "models": MODEL_INFO, "bounds": BOUNDS, "classes": CLASS_LABELS}
 
 
+@app.post("/reload")
+def reload_models():
+    """Re-read the model files from Models/ (called by the Airflow retrain DAG after a promotion)."""
+    load_models()
+    return {"available_models": list(MODELS), "models": MODEL_INFO}
+
+
+@app.post("/submissions", status_code=201)
+def submit_feedback(data: SubmissionInput):
+    """Real data from users: measurements + how the garment actually fit.
+
+    The record is only queued here. The Airflow `fitcheck_data_ingestion` DAG turns queued
+    feedback into dataset rows on its next run (each run = one addition); after 50 additions
+    the model is retrained and shows up in MLflow.
+    """
+    try:
+        queued = submissions.append_submission(data.model_dump())
+    except OSError as exc:
+        log.error("[fitcheck] could not queue submission: %s", exc)
+        raise HTTPException(status_code=503, detail="Could not store the feedback, try again later")
+    log.info("[fitcheck] feedback queued #%d: %s", queued, data.model_dump())
+    return {"status": "queued", "queue_position": queued, "actual_fit": CLASS_LABELS[data.actual_fit]}
+
+
+@app.get("/submissions/stats")
+def submission_stats():
+    """How many user feedback records have been received so far."""
+    return {"total_received": submissions.count_lines()}
+
+
 @app.post("/predict")
 def predict(data: PredictionInput):
-    model = MODELS.get(data.model)
+    # Take one consistent snapshot, in case /reload swaps the models mid-request
+    models, model_info = MODELS, MODEL_INFO
+    model = models.get(data.model)
     if model is None:
         raise HTTPException(status_code=503, detail=f"Model '{data.model}' is not loaded")
 
@@ -131,7 +181,7 @@ def predict(data: PredictionInput):
     # 4. Audit trail: the exact row the model received and which model file answered
     model_input_row = {k: (v.item() if hasattr(v, "item") else v) for k, v in model_input.iloc[0].items()}
     log.info("[fitcheck] predict model=%s sha=%s input=%s -> %s %s (%.1f ms)",
-             data.model, MODEL_INFO[data.model]["sha256"], model_input_row,
+             data.model, model_info[data.model]["sha256"], model_input_row,
              CLASS_LABELS.get(prediction_id), probs, inference_ms)
 
     return {
@@ -142,7 +192,7 @@ def predict(data: PredictionInput):
         "model": data.model,
         "probabilities": probs,
         # Traceability fields (added; the original fields above are unchanged)
-        "model_info": MODEL_INFO[data.model],
+        "model_info": model_info[data.model],
         "model_input": model_input_row,
         "inference_ms": round(inference_ms, 2),
     }
