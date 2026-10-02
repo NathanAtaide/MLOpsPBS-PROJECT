@@ -129,6 +129,15 @@
   .trace pre { margin: 4px 0 0; padding: 8px 10px; background: var(--surface-2); border-radius: 6px; font-size: 12px; overflow-x: auto; }
 
   .empty { color: var(--muted); text-align: center; padding: 28px 8px; }
+  /* Feedback from real users (sent to POST /submissions, used for retraining) */
+  .feedback { margin-top: 18px; padding: 16px; border-radius: 12px; border: 1px dashed var(--border); background: var(--surface-2); font-size: 16px; }
+  .feedback p { margin: 0 0 12px; font-size: 16px; line-height: 1.4; }
+  .feedback .fb-btns { display: flex; flex-wrap: wrap; gap: 8px; }
+  .feedback button { padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface); cursor: pointer; font-size: 16px; font-weight: 600; }
+  .feedback button:hover { border-color: var(--muted); }
+  .feedback button:disabled { opacity: .6; cursor: default; }
+  .feedback small { display: block; margin-top: 10px; color: var(--muted); font-size: 14px; }
+  .feedback .fb-done { font-weight: 600; font-size: 16px; }
   .error { color: var(--small); background: var(--small-bg); padding: 10px 12px; border-radius: 8px; font-size: 14px; }
   .loading { opacity: .55; transition: opacity .2s; }
   footer { color: var(--muted); font-size: 12.5px; margin-top: 24px; }
@@ -428,7 +437,16 @@ async function evaluate() {
           </div>`;
         }).join("")}
       </div>
-      ${traceDetails(models, byModel, chosen)}`;
+      ${traceDetails(models, byModel, chosen)}
+      <div class="feedback" id="feedback">
+        <p><b>Tried size ${chosen} on?</b> Tell us how it really fit. Your answer is added to the training data.</p>
+        <div class="fb-btns" role="group" aria-label="How did it fit?">
+          <button data-fit="0">Too small</button>
+          <button data-fit="1">Good fit</button>
+          <button data-fit="2">Too large</button>
+        </div>
+        <small>Sent to <code>POST /submissions</code>; the Airflow pipeline retrains the model after enough additions.</small>
+      </div>`;
   } catch (e) {
     if (seq !== requestSeq) return;
     card.innerHTML = `<div class="error">Prediction failed: ${esc(e.message)}</div>`;
@@ -470,6 +488,34 @@ $("catalog").addEventListener("click", (e) => {
 $("result-card").addEventListener("click", (e) => {
   const b = e.target.closest("[data-size]"); if (!b) return;
   state.size = b.dataset.size; evaluate();
+});
+
+// Real feedback: what the user experienced with the size on screen -> POST /submissions
+$("result-card").addEventListener("click", async (e) => {
+  const b = e.target.closest("[data-fit]"); if (!b) return;
+  const garment = CATALOG.find((g) => g.id === state.garmentId);
+  if (!garment || !state.size) return;
+  const box = $("feedback");
+  box.querySelectorAll("button").forEach((x) => (x.disabled = true));
+  try {
+    const res = await fetch(`${API}/submissions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        height_cm: state.height,
+        weight_kg: state.weight,
+        garment_chest_cm: garment.sizes[state.size],
+        fabric_stretch_pct: garment.stretch,
+        product_type_id: garment.type,
+        actual_fit: Number(b.dataset.fit),
+      }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    box.innerHTML = `<div class="fb-done">Thanks! Recorded: size ${esc(state.size)} was "${CLASS[b.dataset.fit]}".</div>`;
+  } catch (err) {
+    box.querySelectorAll("button").forEach((x) => (x.disabled = false));
+    box.insertAdjacentHTML("beforeend", `<div class="error" style="margin-top:10px;font-size:16px">Could not send feedback: ${esc(err.message)}</div>`);
+  }
 });
 
 // Remember whether the trace panel is open across re-renders ("toggle" does not bubble -> capture)

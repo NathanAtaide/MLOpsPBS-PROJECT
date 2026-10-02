@@ -8,3 +8,6 @@ db/*.bak
 data/
 # Remova o símbolo '#' da linha abaixo se os arquivos da pasta artifacts forem maiores que 50MB
 # artifacts/
+
+# Local MLflow file store created by running the pipeline outside docker
+mlruns/

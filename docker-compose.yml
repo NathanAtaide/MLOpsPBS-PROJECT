@@ -1,15 +1,19 @@
-# FitCheck MLOps stack: one image, three services.
+# FitCheck MLOps stack: one image, four services.
 #   docker compose up -d --build
-#   Jupyter -> http://localhost:8888   MLflow -> http://localhost:5001   API + UI -> http://localhost:3000
+#   Jupyter -> http://localhost:8888   MLflow -> http://localhost:5001
+#   API + UI -> http://localhost:3000  Airflow -> http://localhost:8081 (AIRFLOW_HOST_PORT)
 #
-# Ports are bound to 127.0.0.1 only: Jupyter runs without a token, so it must not
-# be reachable from other machines on your network.
+# Ports are bound to 127.0.0.1 only: Jupyter and Airflow run without a login, so they
+# must not be reachable from other machines on your network.
 
 x-fitcheck-image: &fitcheck-image
   build:
     context: .
     dockerfile: docker/Dockerfile
   image: fitcheck-mlops:latest
+  # Always (re)build on `up` instead of reusing an old fitcheck-mlops:latest (e.g. one built
+  # from another branch without Airflow). Unchanged layers come from cache, so it is quick.
+  pull_policy: build
 
 services:
   mlflow:
@@ -82,5 +86,65 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
-      # Read-only: models retrained in Jupyter are served after `docker compose restart api`.
+      # Read-only: new models are served after POST /reload (done by the Airflow retrain DAG)
+      # or `docker compose restart api` (after retraining in Jupyter).
       - ./Models:/app/Models:ro
+      # Read-write: POST /submissions appends user feedback to data/user_submissions.jsonl,
+      # which the Airflow ingestion DAG (same ./data folder) turns into dataset rows.
+      - ./data:/app/data
+
+  airflow:
+    <<: *fitcheck-image
+    container_name: fitcheck-airflow
+    # Standalone = scheduler + DAG processor + triggerer + API server/UI in one container,
+    # with a SQLite metadata DB. Fine for local development, not for production.
+    # Standalone starts each component as `airflow <component>` looked up on PATH, so
+    # Airflow's virtualenv must be on PATH, only for this service: image-wide it would make
+    # `python` point to the venv (no scikit-learn) in the API/Jupyter/MLflow containers.
+    # ($$ = a literal $ for the shell; a single $ would be substituted by docker compose.)
+    command: ["sh", "-c", "export PATH=/opt/airflow-venv/bin:$$PATH && exec airflow standalone"]
+    working_dir: /app
+    environment:
+      # API server / UI listens on all interfaces inside the container, port 8080
+      AIRFLOW__API__HOST: 0.0.0.0
+      AIRFLOW__API__PORT: "8080"
+      AIRFLOW__CORE__DAGS_FOLDER: /app/airflow/dags
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      # No login screen: whoever opens the UI is admin (safe only because the port is localhost-only)
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+      # What the DAG tasks need (they run the ML code with the image's main Python)
+      FITCHECK_PYTHON: /usr/local/bin/python
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      FITCHECK_API_URL: http://api:3000
+      MODEL_DIR: /app/Models
+      PYTHONPATH: /app/src
+      # Pipeline knobs
+      FITCHECK_ROWS_PER_ADDITION: "100"       # random rows per addition
+      FITCHECK_INGEST_EVERY_MINUTES: "1"      # one addition per minute
+      FITCHECK_ADDITIONS_PER_RETRAIN: "50"    # retrain after 50 additions
+      FITCHECK_PROMOTION_TOLERANCE: "0.005"   # promote unless macro-F1 drops more than this
+      KAGGLE_USERNAME: ${KAGGLE_USERNAME:-}
+      KAGGLE_KEY: ${KAGGLE_KEY:-}
+    ports:
+      # Host port 8081 by default, so it doesn't clash with another Airflow on 8080 (Airflow's
+      # default). Change it with AIRFLOW_HOST_PORT in a .env file; inside the container it stays 8080.
+      - "127.0.0.1:${AIRFLOW_HOST_PORT:-8081}:8080"
+    volumes:
+      # Project mounted read-write: the pipeline writes data/ (dataset + state) and Models/
+      - .:/app
+      # Airflow's own DB, logs and config stay in a Docker volume (SQLite on Windows mounts is unreliable)
+      - airflow-home:/opt/airflow
+    depends_on:
+      mlflow:
+        condition: service_healthy
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/v2/monitor/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 5
+
+volumes:
+  airflow-home:
